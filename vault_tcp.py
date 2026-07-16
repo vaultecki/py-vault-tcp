@@ -294,11 +294,18 @@ class VaultConnection:
                 self.close()
                 raise VaultProtocolError(f"Send failed: {e}") from e
 
-    def receive(self) -> bytes:
+    def receive(self, timeout: float | None = None) -> bytes:
         """
         Receive a single framed message and decrypt.
 
         Not thread-safe - should be called from single thread only.
+
+        Args:
+            timeout: Total time budget for reading this message (header and
+                payload combined). Defaults to message_timeout. Overriding it
+                lets a caller (e.g. VaultTCPServer, for idle-connection
+                polling) poll more or less often than message_timeout without
+                that also being the per-connect message_timeout default.
 
         Returns:
             Decrypted plaintext message
@@ -323,9 +330,14 @@ class VaultConnection:
         if not self._handshake_complete:
             raise VaultProtocolError("Handshake not completed")
 
+        # Header and payload share a single deadline instead of each getting
+        # their own full timeout - otherwise one receive() call could block
+        # for up to 2x the configured timeout.
+        deadline = time.monotonic() + (self.message_timeout if timeout is None else timeout)
+
         # Read 4-byte length header
         try:
-            header = _recv_exact(self.sock, 4, timeout=self.message_timeout)
+            header = _recv_exact(self.sock, 4, timeout=max(0.0, deadline - time.monotonic()))
         except EOFError as e:
             self.close()
             raise VaultConnectionClosed("Connection closed while reading length") from e
@@ -348,14 +360,24 @@ class VaultConnection:
                 f"Invalid message length: {length} (max: {max_ciphertext_size})"
             )
 
-        # Read payload
+        # Read payload. Unlike the header read above, a timeout here is never
+        # safe to treat as "no activity yet, retry" even if zero payload
+        # bytes have arrived: the header has already been consumed from the
+        # stream, so abandoning this read would desync the next receive()
+        # call's attempt to read a fresh header from what is actually still
+        # this message's payload.
         try:
-            ciphertext = _recv_exact(self.sock, length, timeout=self.message_timeout)
+            remaining = max(0.0, deadline - time.monotonic())
+            ciphertext = _recv_exact(self.sock, length, timeout=remaining)
         except EOFError as e:
             self.close()
             raise VaultConnectionClosed("Connection closed while reading payload") from e
-        except TimeoutError:
-            raise
+        except TimeoutError as e:
+            self.close()
+            raise VaultProtocolError(
+                "Timed out waiting for payload after the header was already "
+                "read; connection framing is desynchronized"
+            ) from e
         except VaultProtocolError:
             self.close()
             raise
@@ -534,12 +556,21 @@ class VaultTCPServer:
                 except Exception:
                     logger.exception("on_connect callback failed for conn %d", conn_id)
 
-            # Message receive loop with idle timeout
+            # Message receive loop with idle timeout. When idle_timeout is
+            # shorter than message_timeout, poll at idle_timeout's cadence
+            # instead of waiting a full message_timeout between idle checks
+            # (that would delay disconnecting an idle client by up to
+            # message_timeout - idle_timeout seconds). This also caps how
+            # long a single message transfer on this connection may take.
+            poll_timeout = self.message_timeout
+            if self.idle_timeout > 0:
+                poll_timeout = min(self.message_timeout, self.idle_timeout)
+
             last_activity = time.time()
 
             while self._running.is_set():
                 try:
-                    plaintext = conn.receive()
+                    plaintext = conn.receive(timeout=poll_timeout)
                     last_activity = time.time()
 
                     # Deliver to callback

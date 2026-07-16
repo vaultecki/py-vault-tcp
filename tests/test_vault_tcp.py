@@ -264,6 +264,68 @@ def test_connection_partial_frame_timeout_closes_connection() -> None:
         sock2.close()
 
 
+def test_connection_receive_timeout_budget_is_not_doubled() -> None:
+    """Header and payload reads must share one timeout budget, not each get
+    a full message_timeout (which would let one receive() call block for up
+    to 2x message_timeout)."""
+    sock1, sock2 = socket.socketpair()
+    try:
+        initiator = VaultConnection(sock1, "Noise_NN_25519_AESGCM_SHA512", is_initiator=True)
+        responder = VaultConnection(
+            sock2, "Noise_NN_25519_AESGCM_SHA512", is_initiator=False, message_timeout=0.3
+        )
+        _do_handshake_pair(initiator, responder)
+        # Nothing is ever sent, so this always times out; only the elapsed
+        # time is under test here.
+
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            responder.receive()
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 0.6  # well under 2x message_timeout (0.6s)
+    finally:
+        sock1.close()
+        sock2.close()
+
+
+def test_connection_payload_timeout_after_header_closes_connection() -> None:
+    """A timeout while waiting for the payload must not be treated as a safe,
+    retryable idle timeout even if zero payload bytes arrived: the header was
+    already consumed, so retrying would misread the stream."""
+    sock1, sock2 = socket.socketpair()
+    try:
+        initiator = VaultConnection(sock1, "Noise_NN_25519_AESGCM_SHA512", is_initiator=True)
+        responder = VaultConnection(
+            sock2, "Noise_NN_25519_AESGCM_SHA512", is_initiator=False, message_timeout=0.2
+        )
+        _do_handshake_pair(initiator, responder)
+
+        sock1.sendall((100).to_bytes(4, "big"))  # full header, then never send the payload
+
+        with pytest.raises(VaultProtocolError, match="desynchronized"):
+            responder.receive()
+        assert responder._closed is True
+    finally:
+        sock1.close()
+        sock2.close()
+
+
+def test_idle_timeout_disconnects_inactive_client(server: VaultTCPServer) -> None:
+    server.idle_timeout = 0.3
+    server.message_timeout = 2.0  # much larger than idle_timeout on purpose
+
+    disconnected_ids: list[int] = []
+    server.on_disconnect = disconnected_ids.append
+
+    with _client(server):
+        deadline = time.time() + 2.0
+        while not disconnected_ids and time.time() < deadline:
+            time.sleep(0.02)
+
+    assert len(disconnected_ids) == 1
+
+
 def test_connection_context_manager_closes_socket() -> None:
     sock1, sock2 = socket.socketpair()
     try:
