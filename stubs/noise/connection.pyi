@@ -14,8 +14,18 @@ class Keypair(Enum):
     EPHEMERAL = ...
     REMOTE_EPHEMERAL = ...
 
+class _KeyPair:
+    public_bytes: bytes
+
+class _HandshakeState:
+    rs: _KeyPair | None
+
+class _NoiseProtocol:
+    handshake_state: _HandshakeState
+
 class NoiseConnection:
     handshake_finished: bool
+    noise_protocol: _NoiseProtocol
 
     @classmethod
     def from_name(cls, name: bytes) -> NoiseConnection: ...

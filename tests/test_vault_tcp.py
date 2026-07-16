@@ -30,6 +30,13 @@ def _generate_static_key() -> bytes:
     )
 
 
+def _public_bytes(private_key: bytes) -> bytes:
+    public = X25519PrivateKey.from_private_bytes(private_key).public_key()
+    return public.public_bytes(
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
+    )
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -376,6 +383,101 @@ def test_authenticated_xx_handshake_roundtrip() -> None:
     finally:
         sock1.close()
         sock2.close()
+
+
+def test_get_remote_static_none_for_nn() -> None:
+    """NN never exchanges a static key, so there's nothing to authenticate."""
+    sock1, sock2 = socket.socketpair()
+    try:
+        initiator = VaultConnection(sock1, "Noise_NN_25519_AESGCM_SHA512", is_initiator=True)
+        responder = VaultConnection(sock2, "Noise_NN_25519_AESGCM_SHA512", is_initiator=False)
+        _do_handshake_pair(initiator, responder)
+
+        assert initiator.get_remote_static() is None
+        assert responder.get_remote_static() is None
+    finally:
+        sock1.close()
+        sock2.close()
+
+
+def test_get_remote_static_returns_peer_public_key_for_xx() -> None:
+    """XX exchanges static keys, so each side should see the other's public key."""
+    initiator_key = _generate_static_key()
+    responder_key = _generate_static_key()
+
+    sock1, sock2 = socket.socketpair()
+    try:
+        initiator = VaultConnection(
+            sock1, "Noise_XX_25519_AESGCM_SHA512", is_initiator=True, static_key=initiator_key
+        )
+        responder = VaultConnection(
+            sock2, "Noise_XX_25519_AESGCM_SHA512", is_initiator=False, static_key=responder_key
+        )
+        _do_handshake_pair(initiator, responder)
+
+        assert initiator.get_remote_static() == _public_bytes(responder_key)
+        assert responder.get_remote_static() == _public_bytes(initiator_key)
+    finally:
+        sock1.close()
+        sock2.close()
+
+
+def test_server_constructor_does_not_bind_port() -> None:
+    """Constructing a server must not reserve the port - only start() should."""
+    port = _free_port()
+    srv1 = VaultTCPServer(listen_ip="127.0.0.1", listen_port=port)
+    srv2 = VaultTCPServer(listen_ip="127.0.0.1", listen_port=port)  # must not raise
+    del srv1, srv2
+
+
+def test_client_allowlist_accepts_known_key_rejects_unknown() -> None:
+    allowed_key = _generate_static_key()
+    other_key = _generate_static_key()
+
+    srv = VaultTCPServer(
+        listen_ip="127.0.0.1",
+        listen_port=_free_port(),
+        proto_name="Noise_XX_25519_AESGCM_SHA512",
+        static_key=_generate_static_key(),
+        client_allowlist={_public_bytes(allowed_key)},
+        handshake_timeout=2.0,
+        message_timeout=2.0,
+        idle_timeout=0,
+    )
+    srv.start()
+    try:
+        connected_ids: list[int] = []
+        srv.on_connect = connected_ids.append
+
+        with _client(
+            srv, proto_name="Noise_XX_25519_AESGCM_SHA512", static_key=allowed_key
+        ) as client:
+            deadline = time.time() + 2.0
+            while not connected_ids and time.time() < deadline:
+                time.sleep(0.02)
+            assert len(connected_ids) == 1
+            client.send(b"hi")  # connection should be usable
+
+        rejected = VaultTCPClient(
+            server_ip=srv.listen_ip,
+            server_port=srv.listen_port,
+            proto_name="Noise_XX_25519_AESGCM_SHA512",
+            static_key=other_key,
+            handshake_timeout=2.0,
+            message_timeout=2.0,
+        )
+        rejected.connect()
+        try:
+            # Server closes the connection after rejecting the allowlist check;
+            # the client observes this as a closed connection on next I/O.
+            with pytest.raises((VaultProtocolError, VaultConnectionClosed, OSError)):
+                rejected.send_and_receive(b"hi")
+        finally:
+            rejected.close()
+
+        assert len(connected_ids) == 1
+    finally:
+        srv.close()
 
 
 def test_handshake_timeout_raises_timeout_error() -> None:

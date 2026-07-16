@@ -142,6 +142,12 @@ class VaultConnection:
         self._send_lock = threading.Lock()
         self._handshake_complete = False
         self._closed = False
+        # noiseprotocol deletes NoiseConnection.noise_protocol.handshake_state
+        # the instant the handshake finishes (to free handshake-only key
+        # material), so the remote static key must be captured from this
+        # reference - grabbed once handshake_state exists - rather than
+        # looked up again afterwards.
+        self._handshake_state: t.Any = None
 
         # Statistics
         self._bytes_sent = 0
@@ -182,6 +188,7 @@ class VaultConnection:
 
         try:
             self.proto.start_handshake()
+            self._handshake_state = self.proto.noise_protocol.handshake_state
 
             # Noise handshake messages strictly alternate direction, starting
             # with the initiator's first write. Tracking turns explicitly (rather
@@ -397,6 +404,21 @@ class VaultConnection:
 
         return plaintext
 
+    def get_remote_static(self) -> bytes | None:
+        """
+        Return the remote peer's static public key.
+
+        Only patterns that exchange a static key (e.g. XX, IK) populate this;
+        for others (e.g. NN) - or before the handshake reaches that point -
+        this returns None. Used to authenticate a peer's identity after the
+        handshake, e.g. against an allowlist.
+        """
+        # noiseprotocol represents "no remote static key" as an internal
+        # `Empty()` sentinel (patterns like NN), not None - so check for the
+        # attribute rather than the value.
+        public_bytes = getattr(self._handshake_state.rs, "public_bytes", None)
+        return None if public_bytes is None else bytes(public_bytes)
+
     def get_stats(self) -> dict[str, t.Any]:
         """Get connection statistics."""
         return {
@@ -456,6 +478,8 @@ class VaultTCPServer:
         handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
         message_timeout: float = DEFAULT_MESSAGE_TIMEOUT,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        static_key: bytes | None = None,
+        client_allowlist: t.Collection[bytes] | None = None,
     ):
         """
         Initialize VaultTCPServer.
@@ -468,6 +492,15 @@ class VaultTCPServer:
             handshake_timeout: Timeout for handshake
             message_timeout: Timeout for message operations
             idle_timeout: Timeout for idle connections (0 to disable)
+            static_key: Server's static private key (32 bytes for 25519).
+                Required for patterns that authenticate the server (XX, NK,
+                IK, ...); ignored by patterns that don't use one (NN).
+            client_allowlist: If set, restricts which clients may complete a
+                connection: after handshake, the client's static public key
+                (see VaultConnection.get_remote_static()) must be a member,
+                or the connection is rejected. Only meaningful with a
+                pattern that authenticates the client (e.g. XX, IK) - with
+                NN there is no client static key to check against.
         """
         self.listen_ip = listen_ip
         self.listen_port = listen_port
@@ -476,12 +509,12 @@ class VaultTCPServer:
         self.handshake_timeout = handshake_timeout
         self.message_timeout = message_timeout
         self.idle_timeout = idle_timeout
+        self.static_key = static_key
+        self.client_allowlist = set(client_allowlist) if client_allowlist is not None else None
 
-        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_sock.bind((self.listen_ip, self.listen_port))
-        self._server_sock.listen(5)
-
+        # Bound/listened lazily in start(), not here: constructing a server
+        # object should not have the side effect of reserving the port.
+        self._server_sock: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
         self._running = threading.Event()
         self._next_conn_id = 1
@@ -494,10 +527,16 @@ class VaultTCPServer:
         self.on_disconnect: t.Callable[[int], None] | None = None
 
     def start(self) -> None:
-        """Start the server (non-blocking)."""
+        """Bind, listen, and start the accept loop (non-blocking)."""
         if self._accept_thread and self._accept_thread.is_alive():
             logger.warning("Server already running")
             return
+
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind((self.listen_ip, self.listen_port))
+        server_sock.listen(5)
+        self._server_sock = server_sock
 
         self._running.set()
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
@@ -506,12 +545,14 @@ class VaultTCPServer:
 
     def _accept_loop(self) -> None:
         """Accept incoming connections."""
+        assert self._server_sock is not None
+        server_sock = self._server_sock
         while self._running.is_set():
             try:
                 # Use timeout to periodically check _running flag
-                self._server_sock.settimeout(1.0)
+                server_sock.settimeout(1.0)
                 try:
-                    client_sock, addr = self._server_sock.accept()
+                    client_sock, addr = server_sock.accept()
                 except TimeoutError:
                     continue
 
@@ -539,9 +580,15 @@ class VaultTCPServer:
                 max_message_size=self.max_message_size,
                 handshake_timeout=self.handshake_timeout,
                 message_timeout=self.message_timeout,
+                static_key=self.static_key,
             )
 
             conn.do_handshake()
+
+            if self.client_allowlist is not None:
+                remote_static = conn.get_remote_static()
+                if remote_static is None or remote_static not in self.client_allowlist:
+                    raise VaultHandshakeError("Client static key not in allowlist")
 
             # Register connection
             with self._conns_lock:
@@ -683,12 +730,13 @@ class VaultTCPServer:
         logger.info("Shutting down server...")
         self._running.clear()
 
-        # Close server socket
-        with contextlib.suppress(Exception):
-            self._server_sock.shutdown(socket.SHUT_RDWR)
+        # Close server socket (may not exist yet if start() was never called)
+        if self._server_sock is not None:
+            with contextlib.suppress(Exception):
+                self._server_sock.shutdown(socket.SHUT_RDWR)
 
-        with contextlib.suppress(Exception):
-            self._server_sock.close()
+            with contextlib.suppress(Exception):
+                self._server_sock.close()
 
         # Wait for accept thread
         if self._accept_thread and self._accept_thread.is_alive():

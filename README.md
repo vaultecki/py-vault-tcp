@@ -37,6 +37,12 @@ server.start()  # non-blocking, spawns its own threads
 server.close()
 ```
 
+> **This default (`Noise_NN_...`) is unauthenticated** - encrypted, but
+> anyone can complete a handshake with the server, and an active
+> man-in-the-middle can too. See "Noise protocol / pattern selection" below
+> before using this for anything where knowing *who* you're talking to
+> matters.
+
 ### Client
 
 ```python
@@ -66,8 +72,14 @@ with VaultTCPClient(server_ip="127.0.0.1", server_port=5004) as client:
 
 Default: `Noise_NN_25519_AESGCM_SHA512` - X25519 key exchange, AES-GCM,
 SHA-512, and the **NN** pattern, meaning neither side authenticates the
-other. Anyone can complete a handshake with the server; only the transport
-is encrypted.
+other. The transport is encrypted, but **NN is vulnerable to an active
+man-in-the-middle**: nothing in the handshake ties the connection to a known
+identity, so anyone (including an attacker positioned on the network path)
+can complete a handshake with the server, and the server has no way to tell
+its intended client from an impostor. Only use the default for
+prototyping, or when the network path is already trusted by some other
+means. For anything where knowing *who* you're talking to matters, use an
+authenticated pattern.
 
 For authentication, pass a different `proto_name` and static keys:
 
@@ -82,7 +94,10 @@ private_bytes = private_key.private_bytes(
     encryption_algorithm=serialization.NoEncryption(),
 )
 
-server = VaultTCPServer(proto_name="Noise_XX_25519_AESGCM_SHA512")
+server = VaultTCPServer(
+    proto_name="Noise_XX_25519_AESGCM_SHA512",
+    static_key=private_bytes,
+)
 client = VaultTCPClient(
     proto_name="Noise_XX_25519_AESGCM_SHA512",
     static_key=private_bytes,
@@ -93,10 +108,35 @@ Pattern letters (see the [Noise spec](http://www.noiseprotocol.org/noise.html#ha
 
 | Pattern | Meaning |
 |---|---|
-| NN | No authentication (default) |
+| NN | No authentication (default) - vulnerable to active MITM |
 | XX | Both sides authenticate, static keys exchanged during handshake |
 | NK | Client verifies a known server static key |
 | IK | Client sends its static key immediately, knows the server's in advance |
+
+### Restricting which clients may connect
+
+With a pattern that authenticates the client (XX, IK, ...), pass
+`client_allowlist` to `VaultTCPServer` to reject any client whose static
+public key isn't in the set - otherwise an authenticated pattern only
+proves the client holds *some* consistent key pair, not that it's one you
+recognize:
+
+```python
+allowed_clients = {client_public_key_bytes, ...}  # 32 raw bytes each, X25519
+
+server = VaultTCPServer(
+    proto_name="Noise_XX_25519_AESGCM_SHA512",
+    static_key=server_private_bytes,
+    client_allowlist=allowed_clients,
+)
+```
+
+A rejected client completes the (cryptographic) handshake but the
+connection is then immediately closed server-side, before it is registered
+or any callback fires. `VaultConnection.get_remote_static()` returns the
+peer's static public key after handshake (or `None` for patterns that don't
+exchange one, e.g. NN) if you need to inspect or authenticate it yourself
+instead.
 
 ## API
 
@@ -111,15 +151,21 @@ VaultTCPServer(
     handshake_timeout: float = 10.0,
     message_timeout: float = 30.0,
     idle_timeout: float = 300.0,  # 0 disables idle disconnection
+    static_key: bytes | None = None,
+    client_allowlist: Collection[bytes] | None = None,
 )
 ```
 
-- `start()` / `close()` - start/stop the accept loop and disconnect all clients
+- `start()` - binds the socket, starts listening, and starts the accept
+  loop (nothing is bound until this is called)
+- `close()` - stop the accept loop and disconnect all clients
 - `send_to(conn_id, data)`, `broadcast(data)`
 - `get_connection_ids() -> list[int]`
 - `get_connection_stats(conn_id) -> dict`
 - callbacks: `on_connect(conn_id)`, `on_message(conn_id, data, conn)`,
   `on_disconnect(conn_id)` - set before calling `start()`
+- `static_key` / `client_allowlist` - see "Restricting which clients may
+  connect" above
 
 ### `VaultTCPClient`
 
@@ -178,8 +224,10 @@ logging.getLogger("vault_tcp").setLevel(logging.DEBUG)
 
 ## Limitations / things to know before using this for anything real
 
-- Default pattern (NN) is unauthenticated - use XX/NK/IK if you need to
-  verify who you're talking to.
+- Default pattern (NN) is unauthenticated and vulnerable to an active
+  man-in-the-middle - use XX/NK/IK if you need to verify who you're talking
+  to, plus `client_allowlist` on the server if you also need to restrict
+  which authenticated clients are accepted.
 - No built-in rate limiting or connection limits.
 - One thread per connection; not tested at high connection counts.
 - `max_message_size` bounds a single message but there's no application-level
