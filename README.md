@@ -361,6 +361,12 @@ mypy vault_tcp.py     # type-check
 pytest                # run the test suite
 ```
 
+To run these automatically before each commit:
+
+```bash
+pre-commit install
+```
+
 ## Testing
 
 Run the included example:
