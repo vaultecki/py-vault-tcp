@@ -8,14 +8,26 @@ import time
 from collections.abc import Iterator
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 from vault_tcp import (
     VaultConnection,
     VaultConnectionClosed,
+    VaultHandshakeError,
     VaultProtocolError,
     VaultTCPClient,
     VaultTCPServer,
 )
+
+
+def _generate_static_key() -> bytes:
+    key = X25519PrivateKey.generate()
+    return key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
 
 
 def _free_port() -> int:
@@ -324,6 +336,69 @@ def test_idle_timeout_disconnects_inactive_client(server: VaultTCPServer) -> Non
             time.sleep(0.02)
 
     assert len(disconnected_ids) == 1
+
+
+def test_authenticated_xx_handshake_roundtrip() -> None:
+    """XX authenticates both sides via their static keys (exchanged, encrypted,
+    during the handshake itself - unlike NN, which is fully anonymous)."""
+    sock1, sock2 = socket.socketpair()
+    try:
+        initiator = VaultConnection(
+            sock1,
+            "Noise_XX_25519_AESGCM_SHA512",
+            is_initiator=True,
+            static_key=_generate_static_key(),
+        )
+        responder = VaultConnection(
+            sock2,
+            "Noise_XX_25519_AESGCM_SHA512",
+            is_initiator=False,
+            static_key=_generate_static_key(),
+        )
+        _do_handshake_pair(initiator, responder)
+
+        initiator.send(b"authenticated hello")
+        assert responder.receive() == b"authenticated hello"
+    finally:
+        sock1.close()
+        sock2.close()
+
+
+def test_handshake_timeout_raises_timeout_error() -> None:
+    """If the peer never responds, do_handshake() must time out rather than
+    block forever."""
+    sock1, sock2 = socket.socketpair()
+    try:
+        initiator = VaultConnection(
+            sock1, "Noise_NN_25519_AESGCM_SHA512", is_initiator=True, handshake_timeout=0.2
+        )
+        # Nothing reads sock2's end or responds, so initiator's read after
+        # its first write will time out.
+        with pytest.raises(TimeoutError):
+            initiator.do_handshake()
+    finally:
+        sock1.close()
+        sock2.close()
+
+
+def test_handshake_proto_mismatch_raises_handshake_error() -> None:
+    """Mismatched Noise patterns produce handshake messages the other side
+    can't parse - this must surface as VaultHandshakeError, not hang or
+    crash with a raw library exception."""
+    sock1, sock2 = socket.socketpair()
+    try:
+        initiator = VaultConnection(
+            sock1, "Noise_NN_25519_AESGCM_SHA512", is_initiator=True, handshake_timeout=2.0
+        )
+        responder = VaultConnection(
+            sock2, "Noise_XX_25519_AESGCM_SHA512", is_initiator=False, handshake_timeout=2.0
+        )
+
+        with pytest.raises((VaultHandshakeError, TimeoutError)):
+            _do_handshake_pair(initiator, responder)
+    finally:
+        sock1.close()
+        sock2.close()
 
 
 def test_connection_context_manager_closes_socket() -> None:
