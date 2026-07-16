@@ -516,6 +516,8 @@ class VaultTCPServer:
                     continue
 
                 logger.info("Accepted connection from %s", addr)
+                # Small framed messages shouldn't wait on Nagle's algorithm.
+                client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 threading.Thread(
                     target=self._handle_new_client, args=(client_sock, addr), daemon=True
                 ).start()
@@ -769,6 +771,8 @@ class VaultTCPClient:
 
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(self.handshake_timeout)
+        # Small framed messages shouldn't wait on Nagle's algorithm.
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         try:
             s.connect((self.server_ip, self.server_port))

@@ -117,6 +117,20 @@ def test_broadcast_reaches_all_clients(server: VaultTCPServer) -> None:
         assert c2.receive() == b"hi everyone"
 
 
+def test_tcp_nodelay_is_set_on_both_sides(server: VaultTCPServer) -> None:
+    with _client(server) as client:
+        deadline = time.time() + 2.0
+        while not server.get_connection_ids() and time.time() < deadline:
+            time.sleep(0.02)
+
+        assert client._sock is not None
+        assert client._sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) != 0
+
+        conn_id = server.get_connection_ids()[0]
+        server_sock = server._connections[conn_id].sock
+        assert server_sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) != 0
+
+
 def test_send_to_unknown_connection_raises_key_error(server: VaultTCPServer) -> None:
     with pytest.raises(KeyError):
         server.send_to(999, b"data")
