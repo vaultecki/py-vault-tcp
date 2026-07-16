@@ -27,13 +27,7 @@ import typing as t
 import noise.connection
 from psygnal import Signal
 
-# Logging configuration
-logger = logging.getLogger("vault_tcp")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Constants
 # Fixed by the Noise Protocol Framework spec (section 5, "AEAD"): both cipher
