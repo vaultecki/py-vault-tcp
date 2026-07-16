@@ -35,7 +35,14 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 # Constants
-NOISE_AEAD_OVERHEAD = 16  # Noise protocol AEAD tag size
+# Fixed by the Noise Protocol Framework spec (section 5, "AEAD"): both cipher
+# functions it defines - AESGCM and ChaChaPoly, the only two the noiseprotocol
+# library implements - always produce a 16-byte authentication tag, so
+# ciphertext is always exactly 16 bytes longer than the plaintext regardless
+# of which of the two is negotiated via proto_name. This is not a guess to be
+# kept in sync with proto_name; it would only need to change if a future
+# Noise cipher function with a different tag size were added and used here.
+NOISE_AEAD_OVERHEAD = 16
 DEFAULT_HANDSHAKE_TIMEOUT = 10.0
 DEFAULT_MESSAGE_TIMEOUT = 30.0
 DEFAULT_IDLE_TIMEOUT = 300.0  # 5 minutes
