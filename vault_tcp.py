@@ -15,13 +15,14 @@ Features:
 """
 
 from __future__ import annotations
-import socket
-import threading
-import struct
+
+import contextlib
 import logging
+import socket
+import struct
+import threading
 import time
 import typing as t
-from contextlib import contextmanager
 
 import noise.connection
 
@@ -29,9 +30,7 @@ import noise.connection
 logger = logging.getLogger("vault_tcp")
 if not logger.handlers:
     handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
@@ -44,28 +43,31 @@ DEFAULT_IDLE_TIMEOUT = 300.0  # 5 minutes
 
 class VaultProtocolError(Exception):
     """Raised when protocol-level errors occur."""
+
     pass
 
 
 class VaultHandshakeError(VaultProtocolError):
     """Raised when handshake fails."""
+
     pass
 
 
 class VaultConnectionClosed(VaultProtocolError):
     """Raised when connection is closed unexpectedly."""
+
     pass
 
 
-def _recv_exact(sock: socket.socket, n: int, timeout: t.Optional[float] = None) -> bytes:
+def _recv_exact(sock: socket.socket, n: int, timeout: float | None = None) -> bytes:
     """Read exactly n bytes from socket or raise EOFError."""
     sock.settimeout(timeout)
     data = bytearray()
     while len(data) < n:
         try:
             chunk = sock.recv(n - len(data))
-        except socket.timeout:
-            raise TimeoutError(f"Timeout while reading {n} bytes")
+        except TimeoutError as e:
+            raise TimeoutError(f"Timeout while reading {n} bytes") from e
         if not chunk:
             raise EOFError("Socket closed while reading")
         data.extend(chunk)
@@ -81,15 +83,15 @@ class VaultConnection:
     """
 
     def __init__(
-            self,
-            sock: socket.socket,
-            proto_name: str,
-            is_initiator: bool,
-            max_message_size: int = 64 * 1024,
-            handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
-            message_timeout: float = DEFAULT_MESSAGE_TIMEOUT,
-            static_key: t.Optional[bytes] = None,
-            remote_static: t.Optional[bytes] = None,
+        self,
+        sock: socket.socket,
+        proto_name: str,
+        is_initiator: bool,
+        max_message_size: int = 64 * 1024,
+        handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
+        message_timeout: float = DEFAULT_MESSAGE_TIMEOUT,
+        static_key: bytes | None = None,
+        remote_static: bytes | None = None,
     ):
         """
         Initialize a VaultConnection.
@@ -108,6 +110,7 @@ class VaultConnection:
         self.handshake_timeout = handshake_timeout
         self.message_timeout = message_timeout
         self.max_message_size = max_message_size
+        self._is_initiator = is_initiator
         self._send_lock = threading.Lock()
         self._handshake_complete = False
         self._closed = False
@@ -129,9 +132,7 @@ class VaultConnection:
 
         # Set static keys if provided
         if static_key:
-            self.proto.set_keypair_from_private_bytes(
-                noise.connection.Keypair.STATIC, static_key
-            )
+            self.proto.set_keypair_from_private_bytes(noise.connection.Keypair.STATIC, static_key)
 
         if remote_static:
             self.proto.set_keypair_from_public_bytes(
@@ -154,35 +155,46 @@ class VaultConnection:
         try:
             self.proto.start_handshake()
 
+            # Noise handshake messages strictly alternate direction, starting
+            # with the initiator's first write. Tracking turns explicitly (rather
+            # than probing write_message()/read_message() speculatively) is
+            # required: the underlying library raises if called out of turn.
+            my_turn_to_write = self._is_initiator
+
             # Handshake loop: exchange messages until complete
             while not self.proto.handshake_finished:
-                # Write our handshake message if we have one
-                msg = self.proto.write_message()
-                if msg:
+                if my_turn_to_write:
+                    try:
+                        msg = self.proto.write_message()
+                    except Exception as e:
+                        raise VaultHandshakeError(f"Failed to build handshake message: {e}") from e
+
                     try:
                         self.sock.sendall(msg)
                     except Exception as e:
-                        raise VaultHandshakeError(f"Failed to send handshake message: {e}")
+                        raise VaultHandshakeError(f"Failed to send handshake message: {e}") from e
+                else:
+                    # Read response (Noise handshake messages are small, typically < 1KB)
+                    try:
+                        data = self.sock.recv(4096)
+                    except TimeoutError as e:
+                        raise TimeoutError("Timeout waiting for handshake message") from e
+                    except Exception as e:
+                        raise VaultHandshakeError(
+                            f"Failed to receive handshake message: {e}"
+                        ) from e
 
-                # Check if handshake is done after writing
-                if self.proto.handshake_finished:
-                    break
+                    if not data:
+                        raise VaultHandshakeError("Connection closed during handshake")
 
-                # Read response (Noise handshake messages are small, typically < 1KB)
-                try:
-                    data = self.sock.recv(4096)
-                except socket.timeout:
-                    raise TimeoutError("Timeout waiting for handshake message")
-                except Exception as e:
-                    raise VaultHandshakeError(f"Failed to receive handshake message: {e}")
+                    try:
+                        self.proto.read_message(data)
+                    except Exception as e:
+                        raise VaultHandshakeError(
+                            f"Failed to process handshake message: {e}"
+                        ) from e
 
-                if not data:
-                    raise VaultHandshakeError("Connection closed during handshake")
-
-                try:
-                    self.proto.read_message(data)
-                except Exception as e:
-                    raise VaultHandshakeError(f"Failed to process handshake message: {e}")
+                my_turn_to_write = not my_turn_to_write
 
             # Verify handshake completed successfully
             if not self.proto.handshake_finished:
@@ -223,7 +235,9 @@ class VaultConnection:
             raise TypeError("plaintext must be bytes")
 
         if len(plaintext) > self.max_message_size:
-            raise ValueError(f"Message size {len(plaintext)} exceeds maximum {self.max_message_size}")
+            raise ValueError(
+                f"Message size {len(plaintext)} exceeds maximum {self.max_message_size}"
+            )
 
         with self._send_lock:
             try:
@@ -265,10 +279,10 @@ class VaultConnection:
         # Read 4-byte length header
         try:
             header = _recv_exact(self.sock, 4, timeout=self.message_timeout)
-        except EOFError:
-            raise VaultConnectionClosed("Connection closed while reading length")
-        except TimeoutError as e:
-            raise e
+        except EOFError as e:
+            raise VaultConnectionClosed("Connection closed while reading length") from e
+        except TimeoutError:
+            raise
         except Exception as e:
             raise VaultProtocolError(f"Failed to read message length: {e}") from e
 
@@ -284,16 +298,16 @@ class VaultConnection:
         # Read payload
         try:
             ciphertext = _recv_exact(self.sock, length, timeout=self.message_timeout)
-        except EOFError:
-            raise VaultConnectionClosed("Connection closed while reading payload")
-        except TimeoutError as e:
-            raise e
+        except EOFError as e:
+            raise VaultConnectionClosed("Connection closed while reading payload") from e
+        except TimeoutError:
+            raise
         except Exception as e:
             raise VaultProtocolError(f"Failed to read payload: {e}") from e
 
         # Decrypt
         try:
-            plaintext = self.proto.decrypt(ciphertext)
+            plaintext = bytes(self.proto.decrypt(ciphertext))
         except Exception as e:
             raise VaultProtocolError(f"Decryption failed: {e}") from e
 
@@ -302,7 +316,7 @@ class VaultConnection:
 
         return plaintext
 
-    def get_stats(self) -> dict:
+    def get_stats(self) -> dict[str, t.Any]:
         """Get connection statistics."""
         return {
             "bytes_sent": self._bytes_sent,
@@ -321,21 +335,22 @@ class VaultConnection:
 
         self._closed = True
 
-        try:
+        with contextlib.suppress(Exception):
             self.sock.shutdown(socket.SHUT_RDWR)
-        except Exception:
-            pass
 
-        try:
+        with contextlib.suppress(Exception):
             self.sock.close()
-        except Exception:
-            pass
 
-    def __enter__(self):
+    def __enter__(self) -> VaultConnection:
         """Context manager entry."""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: t.Any,
+    ) -> t.Literal[False]:
         """Context manager exit."""
         self.close()
         return False
@@ -352,14 +367,14 @@ class VaultTCPServer:
     """
 
     def __init__(
-            self,
-            listen_ip: str = "0.0.0.0",
-            listen_port: int = 5004,
-            proto_name: str = "Noise_NN_25519_AESGCM_SHA512",
-            max_message_size: int = 64 * 1024,
-            handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
-            message_timeout: float = DEFAULT_MESSAGE_TIMEOUT,
-            idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        self,
+        listen_ip: str = "0.0.0.0",
+        listen_port: int = 5004,
+        proto_name: str = "Noise_NN_25519_AESGCM_SHA512",
+        max_message_size: int = 64 * 1024,
+        handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
+        message_timeout: float = DEFAULT_MESSAGE_TIMEOUT,
+        idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
     ):
         """
         Initialize VaultTCPServer.
@@ -386,16 +401,16 @@ class VaultTCPServer:
         self._server_sock.bind((self.listen_ip, self.listen_port))
         self._server_sock.listen(5)
 
-        self._accept_thread: t.Optional[threading.Thread] = None
+        self._accept_thread: threading.Thread | None = None
         self._running = threading.Event()
         self._next_conn_id = 1
         self._conns_lock = threading.Lock()
-        self._connections: t.Dict[int, VaultConnection] = {}
+        self._connections: dict[int, VaultConnection] = {}
 
         # Callbacks (set these before calling start())
-        self.on_message: t.Optional[t.Callable[[int, bytes, VaultConnection], None]] = None
-        self.on_connect: t.Optional[t.Callable[[int], None]] = None
-        self.on_disconnect: t.Optional[t.Callable[[int], None]] = None
+        self.on_message: t.Callable[[int, bytes, VaultConnection], None] | None = None
+        self.on_connect: t.Callable[[int], None] | None = None
+        self.on_disconnect: t.Callable[[int], None] | None = None
 
     def start(self) -> None:
         """Start the server (non-blocking)."""
@@ -416,20 +431,18 @@ class VaultTCPServer:
                 self._server_sock.settimeout(1.0)
                 try:
                     client_sock, addr = self._server_sock.accept()
-                except socket.timeout:
+                except TimeoutError:
                     continue
 
                 logger.info("Accepted connection from %s", addr)
                 threading.Thread(
-                    target=self._handle_new_client,
-                    args=(client_sock, addr),
-                    daemon=True
+                    target=self._handle_new_client, args=(client_sock, addr), daemon=True
                 ).start()
             except Exception as e:
                 if self._running.is_set():
                     logger.exception("Accept loop error: %s", e)
 
-    def _handle_new_client(self, client_sock: socket.socket, addr: tuple) -> None:
+    def _handle_new_client(self, client_sock: socket.socket, addr: tuple[str, int]) -> None:
         """Handle a new client connection."""
         conn_id = 0
         conn = None
@@ -477,7 +490,7 @@ class VaultTCPServer:
                         except Exception:
                             logger.exception("on_message callback failed for conn %d", conn_id)
 
-                except socket.timeout:
+                except TimeoutError:
                     # Check idle timeout
                     if self.idle_timeout > 0:
                         idle_time = time.time() - last_activity
@@ -505,10 +518,8 @@ class VaultTCPServer:
             if conn_id:
                 with self._conns_lock:
                     if conn_id in self._connections:
-                        try:
+                        with contextlib.suppress(Exception):
                             self._connections[conn_id].close()
-                        except Exception:
-                            pass
                         del self._connections[conn_id]
 
                 # Call on_disconnect callback
@@ -521,10 +532,8 @@ class VaultTCPServer:
                 logger.info("Connection %d cleaned up", conn_id)
             else:
                 # Handshake failed, close socket directly
-                try:
+                with contextlib.suppress(Exception):
                     client_sock.close()
-                except Exception:
-                    pass
 
     def send_to(self, conn_id: int, data: bytes) -> None:
         """
@@ -562,12 +571,12 @@ class VaultTCPServer:
             except Exception:
                 logger.exception("Broadcast send failed for connection %d", cid)
 
-    def get_connection_ids(self) -> t.List[int]:
+    def get_connection_ids(self) -> list[int]:
         """Get list of all active connection IDs."""
         with self._conns_lock:
             return list(self._connections.keys())
 
-    def get_connection_stats(self, conn_id: int) -> dict:
+    def get_connection_stats(self, conn_id: int) -> dict[str, t.Any]:
         """Get statistics for a specific connection."""
         with self._conns_lock:
             conn = self._connections.get(conn_id)
@@ -583,15 +592,11 @@ class VaultTCPServer:
         self._running.clear()
 
         # Close server socket
-        try:
+        with contextlib.suppress(Exception):
             self._server_sock.shutdown(socket.SHUT_RDWR)
-        except Exception:
-            pass
 
-        try:
+        with contextlib.suppress(Exception):
             self._server_sock.close()
-        except Exception:
-            pass
 
         # Wait for accept thread
         if self._accept_thread and self._accept_thread.is_alive():
@@ -602,11 +607,9 @@ class VaultTCPServer:
             conns = list(self._connections.items())
             self._connections.clear()
 
-        for cid, conn in conns:
-            try:
+        for _cid, conn in conns:
+            with contextlib.suppress(Exception):
                 conn.close()
-            except Exception:
-                pass
 
         logger.info("Server shutdown complete")
 
@@ -628,15 +631,15 @@ class VaultTCPClient:
     """
 
     def __init__(
-            self,
-            server_ip: str = "127.0.0.1",
-            server_port: int = 5004,
-            proto_name: str = "Noise_NN_25519_AESGCM_SHA512",
-            max_message_size: int = 64 * 1024,
-            handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
-            message_timeout: float = DEFAULT_MESSAGE_TIMEOUT,
-            static_key: t.Optional[bytes] = None,
-            remote_static: t.Optional[bytes] = None,
+        self,
+        server_ip: str = "127.0.0.1",
+        server_port: int = 5004,
+        proto_name: str = "Noise_NN_25519_AESGCM_SHA512",
+        max_message_size: int = 64 * 1024,
+        handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
+        message_timeout: float = DEFAULT_MESSAGE_TIMEOUT,
+        static_key: bytes | None = None,
+        remote_static: bytes | None = None,
     ):
         """
         Initialize VaultTCPClient.
@@ -660,8 +663,8 @@ class VaultTCPClient:
         self.static_key = static_key
         self.remote_static = remote_static
 
-        self._sock: t.Optional[socket.socket] = None
-        self._conn: t.Optional[VaultConnection] = None
+        self._sock: socket.socket | None = None
+        self._conn: VaultConnection | None = None
 
     def connect(self) -> None:
         """
@@ -742,7 +745,7 @@ class VaultTCPClient:
         self.send(data)
         return self.receive()
 
-    def get_stats(self) -> dict:
+    def get_stats(self) -> dict[str, t.Any]:
         """Get connection statistics."""
         if not self._conn:
             raise RuntimeError("Not connected")
@@ -751,27 +754,28 @@ class VaultTCPClient:
     def close(self) -> None:
         """Close the connection."""
         if self._conn:
-            try:
+            with contextlib.suppress(Exception):
                 self._conn.close()
-            except Exception:
-                pass
             self._conn = None
 
         if self._sock:
-            try:
+            with contextlib.suppress(Exception):
                 self._sock.close()
-            except Exception:
-                pass
             self._sock = None
 
         logger.info("Client closed")
 
-    def __enter__(self):
+    def __enter__(self) -> VaultTCPClient:
         """Context manager entry."""
         self.connect()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: t.Any,
+    ) -> t.Literal[False]:
         """Context manager exit."""
         self.close()
         return False
@@ -783,31 +787,26 @@ if __name__ == "__main__":
 
     # Configure logging for demo
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
 
-
-    def on_message(conn_id: int, payload: bytes, conn: VaultConnection):
+    def on_message(conn_id: int, payload: bytes, conn: VaultConnection) -> None:
         """Echo server callback."""
         msg = payload.decode("utf-8", errors="replace")
         logger.info("Server received from conn %d: %s", conn_id, msg)
 
         # Echo back
         try:
-            response = f"ECHO: {msg}".encode("utf-8")
+            response = f"ECHO: {msg}".encode()
             conn.send(response)
         except Exception:
             logger.exception("Failed to echo to conn %d", conn_id)
 
-
-    def on_connect(conn_id: int):
+    def on_connect(conn_id: int) -> None:
         logger.info("Client connected: %d", conn_id)
 
-
-    def on_disconnect(conn_id: int):
+    def on_disconnect(conn_id: int) -> None:
         logger.info("Client disconnected: %d", conn_id)
-
 
     # Start server
     server = VaultTCPServer(listen_ip="127.0.0.1", listen_port=5004)

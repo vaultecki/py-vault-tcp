@@ -21,13 +21,16 @@ A Python implementation of secure TCP communication using the [Noise Protocol Fr
 git clone <repository-url>
 cd vault-tcp
 
-# Install dependencies
-pip install -r requirements.txt
+# Install the package
+pip install -e .
+
+# Or, for development (adds ruff, mypy, pytest)
+pip install -e ".[dev]"
 ```
 
 ### Requirements
 
-- Python 3.8 or higher
+- Python 3.10 or higher
 - `noiseprotocol>=0.3.1`
 - `cryptography>=41.0.0`
 
@@ -346,6 +349,17 @@ logging.basicConfig(
 - Use TLS for additional transport security if needed
 - Validate message contents after decryption
 - Run behind a firewall or reverse proxy
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+
+ruff check .          # lint
+ruff format .         # format
+mypy vault_tcp.py     # type-check
+pytest                # run the test suite
+```
 
 ## Testing
 
