@@ -73,7 +73,7 @@ def test_handshake_and_echo_roundtrip(server: VaultTCPServer) -> None:
     def echo(conn_id: int, data: bytes, conn: VaultConnection) -> None:
         conn.send(b"ECHO: " + data)
 
-    server.on_message = echo
+    server.on_message.connect(echo)
 
     with _client(server) as client:
         response = client.send_and_receive(b"hello")
@@ -83,7 +83,7 @@ def test_handshake_and_echo_roundtrip(server: VaultTCPServer) -> None:
 
 def test_multiple_clients_get_distinct_ids(server: VaultTCPServer) -> None:
     connected_ids: list[int] = []
-    server.on_connect = connected_ids.append
+    server.on_connect.connect(connected_ids.append)
 
     with _client(server) as c1, _client(server) as c2:
         # Give the server a moment to register both handshakes.
@@ -99,7 +99,7 @@ def test_multiple_clients_get_distinct_ids(server: VaultTCPServer) -> None:
 
 def test_on_disconnect_called_after_client_closes(server: VaultTCPServer) -> None:
     disconnected_ids: list[int] = []
-    server.on_disconnect = disconnected_ids.append
+    server.on_disconnect.connect(disconnected_ids.append)
 
     client = _client(server)
     client.connect()
@@ -152,7 +152,7 @@ def test_client_stats_track_sent_and_received_messages(server: VaultTCPServer) -
     def echo(conn_id: int, data: bytes, conn: VaultConnection) -> None:
         conn.send(data)
 
-    server.on_message = echo
+    server.on_message.connect(echo)
 
     with _client(server) as client:
         client.send_and_receive(b"abc")
@@ -349,7 +349,7 @@ def test_idle_timeout_disconnects_inactive_client(server: VaultTCPServer) -> Non
     server.message_timeout = 2.0  # much larger than idle_timeout on purpose
 
     disconnected_ids: list[int] = []
-    server.on_disconnect = disconnected_ids.append
+    server.on_disconnect.connect(disconnected_ids.append)
 
     with _client(server):
         deadline = time.time() + 2.0
@@ -447,7 +447,7 @@ def test_client_allowlist_accepts_known_key_rejects_unknown() -> None:
     srv.start()
     try:
         connected_ids: list[int] = []
-        srv.on_connect = connected_ids.append
+        srv.on_connect.connect(connected_ids.append)
 
         with _client(
             srv, proto_name="Noise_XX_25519_AESGCM_SHA512", static_key=allowed_key

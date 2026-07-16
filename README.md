@@ -8,6 +8,7 @@ messages, built on [noiseprotocol](https://github.com/plizonczyk/noiseprotocol).
 - Python 3.10+
 - `noiseprotocol>=0.3.1`
 - `cryptography>=41.0.0`
+- `psygnal>=0.10`
 
 ## Installation
 
@@ -30,7 +31,7 @@ def handle_message(conn_id: int, data: bytes, conn: VaultConnection) -> None:
     conn.send(b"ECHO: " + data)
 
 server = VaultTCPServer(listen_ip="0.0.0.0", listen_port=5004)
-server.on_message = handle_message
+server.on_message.connect(handle_message)
 server.start()  # non-blocking, spawns its own threads
 
 # ...
@@ -57,7 +58,9 @@ with VaultTCPClient(server_ip="127.0.0.1", server_port=5004) as client:
 - Messages are framed as a 4-byte big-endian length prefix followed by the
   Noise ciphertext.
 - `VaultTCPServer` runs an accept loop and spawns one thread per connection.
-  Callbacks (`on_connect`, `on_message`, `on_disconnect`) run on that
+  Its signals (`on_connect`, `on_message`, `on_disconnect`, all
+  [psygnal](https://psygnal.readthedocs.io/) `Signal`s - connect handlers
+  with `server.on_message.connect(handler)`) are emitted on that
   connection's thread.
 - `VaultConnection.send()` is safe to call from multiple threads.
   `VaultConnection.receive()` is not - use it from a single thread per
@@ -162,8 +165,9 @@ VaultTCPServer(
 - `send_to(conn_id, data)`, `broadcast(data)`
 - `get_connection_ids() -> list[int]`
 - `get_connection_stats(conn_id) -> dict`
-- callbacks: `on_connect(conn_id)`, `on_message(conn_id, data, conn)`,
-  `on_disconnect(conn_id)` - set before calling `start()`
+- signals (`psygnal.Signal`, connect any number of handlers with
+  `.connect(handler)` before or after `start()`): `on_connect(conn_id)`,
+  `on_message(conn_id, data, conn)`, `on_disconnect(conn_id)`
 - `static_key` / `client_allowlist` - see "Restricting which clients may
   connect" above
 

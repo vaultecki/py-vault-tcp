@@ -25,6 +25,7 @@ import time
 import typing as t
 
 import noise.connection
+from psygnal import Signal
 
 # Logging configuration
 logger = logging.getLogger("vault_tcp")
@@ -463,11 +464,17 @@ class VaultTCPServer:
     """
     Threaded multi-client server using VaultConnection per client.
 
-    Callbacks:
-        on_message(conn_id: int, plaintext: bytes, conn: VaultConnection) -> None
-        on_connect(conn_id: int) -> None
-        on_disconnect(conn_id: int) -> None
+    Signals (psygnal - connect with e.g. `server.on_message.connect(handler)`):
+        on_connect(conn_id: int): a client's handshake completed and it was
+            registered
+        on_message(conn_id: int, plaintext: bytes, conn: VaultConnection):
+            a message was received and decrypted
+        on_disconnect(conn_id: int): a client's connection was cleaned up
     """
+
+    on_connect = Signal(int)
+    on_message = Signal(int, bytes, VaultConnection)
+    on_disconnect = Signal(int)
 
     def __init__(
         self,
@@ -520,11 +527,6 @@ class VaultTCPServer:
         self._next_conn_id = 1
         self._conns_lock = threading.Lock()
         self._connections: dict[int, VaultConnection] = {}
-
-        # Callbacks (set these before calling start())
-        self.on_message: t.Callable[[int, bytes, VaultConnection], None] | None = None
-        self.on_connect: t.Callable[[int], None] | None = None
-        self.on_disconnect: t.Callable[[int], None] | None = None
 
     def start(self) -> None:
         """Bind, listen, and start the accept loop (non-blocking)."""
@@ -598,12 +600,11 @@ class VaultTCPServer:
 
             logger.info("Connection %d established from %s", conn_id, addr)
 
-            # Call on_connect callback
-            if self.on_connect:
-                try:
-                    self.on_connect(conn_id)
-                except Exception:
-                    logger.exception("on_connect callback failed for conn %d", conn_id)
+            # Emit on_connect signal
+            try:
+                self.on_connect.emit(conn_id)
+            except Exception:
+                logger.exception("on_connect signal handler failed for conn %d", conn_id)
 
             # Message receive loop with idle timeout. When idle_timeout is
             # shorter than message_timeout, poll at idle_timeout's cadence
@@ -622,12 +623,11 @@ class VaultTCPServer:
                     plaintext = conn.receive(timeout=poll_timeout)
                     last_activity = time.time()
 
-                    # Deliver to callback
-                    if self.on_message:
-                        try:
-                            self.on_message(conn_id, plaintext, conn)
-                        except Exception:
-                            logger.exception("on_message callback failed for conn %d", conn_id)
+                    # Emit on_message signal
+                    try:
+                        self.on_message.emit(conn_id, plaintext, conn)
+                    except Exception:
+                        logger.exception("on_message signal handler failed for conn %d", conn_id)
 
                 except TimeoutError:
                     # Check idle timeout
@@ -661,12 +661,11 @@ class VaultTCPServer:
                             self._connections[conn_id].close()
                         del self._connections[conn_id]
 
-                # Call on_disconnect callback
-                if self.on_disconnect:
-                    try:
-                        self.on_disconnect(conn_id)
-                    except Exception:
-                        logger.exception("on_disconnect callback failed for conn %d", conn_id)
+                # Emit on_disconnect signal
+                try:
+                    self.on_disconnect.emit(conn_id)
+                except Exception:
+                    logger.exception("on_disconnect signal handler failed for conn %d", conn_id)
 
                 logger.info("Connection %d cleaned up", conn_id)
             else:
@@ -932,8 +931,8 @@ if __name__ == "__main__":
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
 
-    def on_message(conn_id: int, payload: bytes, conn: VaultConnection) -> None:
-        """Echo server callback."""
+    def handle_message(conn_id: int, payload: bytes, conn: VaultConnection) -> None:
+        """Echo server handler."""
         msg = payload.decode("utf-8", errors="replace")
         logger.info("Server received from conn %d: %s", conn_id, msg)
 
@@ -944,17 +943,17 @@ if __name__ == "__main__":
         except Exception:
             logger.exception("Failed to echo to conn %d", conn_id)
 
-    def on_connect(conn_id: int) -> None:
+    def handle_connect(conn_id: int) -> None:
         logger.info("Client connected: %d", conn_id)
 
-    def on_disconnect(conn_id: int) -> None:
+    def handle_disconnect(conn_id: int) -> None:
         logger.info("Client disconnected: %d", conn_id)
 
     # Start server
     server = VaultTCPServer(listen_ip="127.0.0.1", listen_port=5004)
-    server.on_message = on_message
-    server.on_connect = on_connect
-    server.on_disconnect = on_disconnect
+    server.on_message.connect(handle_message)
+    server.on_connect.connect(handle_connect)
+    server.on_disconnect.connect(handle_disconnect)
     server.start()
 
     logger.info("Echo server running. Press Ctrl+C to stop.")
