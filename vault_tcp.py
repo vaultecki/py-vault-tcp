@@ -60,13 +60,34 @@ class VaultConnectionClosed(VaultProtocolError):
 
 
 def _recv_exact(sock: socket.socket, n: int, timeout: float | None = None) -> bytes:
-    """Read exactly n bytes from socket or raise EOFError."""
+    """
+    Read exactly n bytes from socket.
+
+    A TCP stream has no message boundaries: if a timeout hits after some
+    (but not all) bytes of the frame have already been consumed from the
+    socket, those bytes cannot be put back. Retrying would read the next
+    reply as if it were still part of the current frame's header/payload,
+    silently desynchronizing framing forever. So a partial-read timeout is
+    reported as VaultProtocolError (caller must close the connection),
+    while a timeout with zero bytes read yet is a plain TimeoutError that
+    is safe to retry (e.g. for idle-connection polling).
+
+    Raises:
+        TimeoutError: Timed out before any bytes of this frame arrived.
+        VaultProtocolError: Timed out after partially reading the frame.
+        EOFError: Socket closed before n bytes were read.
+    """
     sock.settimeout(timeout)
     data = bytearray()
     while len(data) < n:
         try:
             chunk = sock.recv(n - len(data))
         except TimeoutError as e:
+            if data:
+                raise VaultProtocolError(
+                    f"Timed out after reading {len(data)}/{n} bytes; "
+                    "connection framing is desynchronized"
+                ) from e
             raise TimeoutError(f"Timeout while reading {n} bytes") from e
         if not chunk:
             raise EOFError("Socket closed while reading")
@@ -220,8 +241,16 @@ class VaultConnection:
         Args:
             plaintext: Message to send (bytes)
 
+        On any encryption or transport failure the connection is closed: the
+        Noise cipher's nonce counter advances on every encrypt() call, so a
+        message that fails to actually reach the peer (partial write, dead
+        socket, ...) leaves both sides' nonce counters out of sync. Continuing
+        to use the connection afterwards would silently corrupt every
+        subsequent message, so it must not be reused - open a new one instead.
+
         Raises:
-            VaultProtocolError: If encryption or sending fails
+            VaultProtocolError: If encryption or sending fails (connection is
+                closed as part of raising this)
             ValueError: If message exceeds max size
             TypeError: If plaintext is not bytes
         """
@@ -243,6 +272,7 @@ class VaultConnection:
             try:
                 ciphertext = self.proto.encrypt(bytes(plaintext))
             except Exception as e:
+                self.close()
                 raise VaultProtocolError(f"Encryption failed: {e}") from e
 
             # Frame: 4-byte length (big-endian) + ciphertext
@@ -254,6 +284,7 @@ class VaultConnection:
                 self._bytes_sent += len(frame)
                 self._messages_sent += 1
             except Exception as e:
+                self.close()
                 raise VaultProtocolError(f"Send failed: {e}") from e
 
     def receive(self) -> bytes:
@@ -265,10 +296,19 @@ class VaultConnection:
         Returns:
             Decrypted plaintext message
 
+        A TimeoutError raised before any bytes of the next frame arrived is
+        safe to retry (used by the server for idle-connection polling). Every
+        other failure - partial-read desync, invalid framing, or a decrypt
+        failure (which may indicate nonce desync or tampering) - closes the
+        connection, since the byte stream or cipher state can no longer be
+        trusted afterwards.
+
         Raises:
-            VaultProtocolError: If receiving or decryption fails
-            VaultConnectionClosed: If connection closed
-            TimeoutError: If receive times out
+            VaultProtocolError: If receiving or decryption fails (connection
+                is closed as part of raising this)
+            VaultConnectionClosed: If connection closed (connection is closed
+                as part of raising this)
+            TimeoutError: If no data arrived yet; connection remains usable
         """
         if self._closed:
             raise VaultProtocolError("Connection is closed")
@@ -280,10 +320,15 @@ class VaultConnection:
         try:
             header = _recv_exact(self.sock, 4, timeout=self.message_timeout)
         except EOFError as e:
+            self.close()
             raise VaultConnectionClosed("Connection closed while reading length") from e
         except TimeoutError:
             raise
+        except VaultProtocolError:
+            self.close()
+            raise
         except Exception as e:
+            self.close()
             raise VaultProtocolError(f"Failed to read message length: {e}") from e
 
         (length,) = struct.unpack("!I", header)
@@ -291,6 +336,7 @@ class VaultConnection:
         # Validate length
         max_ciphertext_size = self.max_message_size + NOISE_AEAD_OVERHEAD
         if length <= 0 or length > max_ciphertext_size:
+            self.close()
             raise VaultProtocolError(
                 f"Invalid message length: {length} (max: {max_ciphertext_size})"
             )
@@ -299,16 +345,22 @@ class VaultConnection:
         try:
             ciphertext = _recv_exact(self.sock, length, timeout=self.message_timeout)
         except EOFError as e:
+            self.close()
             raise VaultConnectionClosed("Connection closed while reading payload") from e
         except TimeoutError:
             raise
+        except VaultProtocolError:
+            self.close()
+            raise
         except Exception as e:
+            self.close()
             raise VaultProtocolError(f"Failed to read payload: {e}") from e
 
         # Decrypt
         try:
             plaintext = bytes(self.proto.decrypt(ciphertext))
         except Exception as e:
+            self.close()
             raise VaultProtocolError(f"Decryption failed: {e}") from e
 
         self._bytes_received += len(header) + len(ciphertext)

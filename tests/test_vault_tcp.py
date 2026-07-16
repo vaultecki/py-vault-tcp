@@ -196,7 +196,71 @@ def test_connection_receive_after_close_raises_connection_closed() -> None:
         sock1.close()
         with pytest.raises(VaultConnectionClosed):
             responder.receive()
+        assert responder._closed is True
     finally:
+        sock2.close()
+
+
+def test_connection_send_failure_closes_connection() -> None:
+    """A failed send leaves the Noise nonce counter advanced but the message
+    never delivered, desynchronizing both sides - the connection must not be
+    reusable afterwards."""
+    sock1, sock2 = socket.socketpair()
+    try:
+        initiator = VaultConnection(sock1, "Noise_NN_25519_AESGCM_SHA512", is_initiator=True)
+        responder = VaultConnection(sock2, "Noise_NN_25519_AESGCM_SHA512", is_initiator=False)
+        _do_handshake_pair(initiator, responder)
+
+        sock1.close()  # sendall() on a closed socket raises
+        with pytest.raises(VaultProtocolError):
+            initiator.send(b"data")
+        assert initiator._closed is True
+
+        with pytest.raises(VaultProtocolError, match="closed"):
+            initiator.send(b"data again")
+    finally:
+        sock2.close()
+
+
+def test_connection_decrypt_failure_closes_connection() -> None:
+    """Garbage ciphertext (tampering, or a desynced nonce) must not leave a
+    connection that looks reusable."""
+    sock1, sock2 = socket.socketpair()
+    try:
+        initiator = VaultConnection(sock1, "Noise_NN_25519_AESGCM_SHA512", is_initiator=True)
+        responder = VaultConnection(sock2, "Noise_NN_25519_AESGCM_SHA512", is_initiator=False)
+        _do_handshake_pair(initiator, responder)
+
+        garbage = b"\x00" * 32
+        sock1.sendall(len(garbage).to_bytes(4, "big") + garbage)
+
+        with pytest.raises(VaultProtocolError, match="Decryption failed"):
+            responder.receive()
+        assert responder._closed is True
+    finally:
+        sock1.close()
+        sock2.close()
+
+
+def test_connection_partial_frame_timeout_closes_connection() -> None:
+    """A timeout after only part of a frame's bytes were consumed leaves the
+    stream byte-misaligned (the consumed bytes can't be put back), so it must
+    raise VaultProtocolError and close rather than a retry-safe TimeoutError."""
+    sock1, sock2 = socket.socketpair()
+    try:
+        initiator = VaultConnection(sock1, "Noise_NN_25519_AESGCM_SHA512", is_initiator=True)
+        responder = VaultConnection(
+            sock2, "Noise_NN_25519_AESGCM_SHA512", is_initiator=False, message_timeout=0.2
+        )
+        _do_handshake_pair(initiator, responder)
+
+        sock1.sendall(b"\x00\x00")  # half of the 4-byte length header, then stall
+
+        with pytest.raises(VaultProtocolError, match="desynchronized"):
+            responder.receive()
+        assert responder._closed is True
+    finally:
+        sock1.close()
         sock2.close()
 
 
