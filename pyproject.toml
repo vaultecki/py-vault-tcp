@@ -46,10 +46,7 @@ select = [
 python_version = "3.10"
 strict = true
 warn_unused_configs = true
-
-[[tool.mypy.overrides]]
-module = "noise.*"
-ignore_missing_imports = true
+mypy_path = "stubs"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
