@@ -1,94 +1,106 @@
-# Vault TCP - Secure TCP Communication with Noise Protocol
+# Vault TCP
 
-A Python implementation of secure TCP communication using the [Noise Protocol Framework](http://www.noiseprotocol.org/).
+TCP client/server for exchanging length-prefixed, Noise Protocol-encrypted
+messages, built on [noiseprotocol](https://github.com/plizonczyk/noiseprotocol).
 
-## Features
+## Requirements
 
-- 🔒 **Strong Encryption**: Uses Noise protocol with X25519, AESGCM, and SHA512
-- 🔄 **Multi-client Support**: Threaded server handles multiple concurrent connections
-- 📦 **Length-Prefixed Framing**: Robust message framing with 4-byte headers
-- ⏱️ **Timeout Management**: Configurable timeouts for handshake, messages, and idle connections
-- 📊 **Statistics**: Built-in connection statistics and monitoring
-- 🧵 **Thread-Safe**: Send operations are thread-safe
-- 🎯 **Context Manager Support**: Clean resource management with `with` statements
-- 🛡️ **Robust Error Handling**: Comprehensive error handling and logging
-- 📝 **Type Hints**: Full type annotations for better IDE support
+- Python 3.10+
+- `noiseprotocol>=0.3.1`
+- `cryptography>=41.0.0`
 
 ## Installation
 
 ```bash
-# Clone the repository
 git clone <repository-url>
 cd vault-tcp
 
-# Install the package
-pip install -e .
-
-# Or, for development (adds ruff, mypy, pytest)
-pip install -e ".[dev]"
+pip install -e .            # runtime only
+pip install -e ".[dev]"     # + ruff, mypy, pytest, pre-commit
 ```
 
-### Requirements
+## Quick start
 
-- Python 3.10 or higher
-- `noiseprotocol>=0.3.1`
-- `cryptography>=41.0.0`
-
-## Quick Start
-
-### Echo Server Example
+### Server
 
 ```python
 from vault_tcp import VaultTCPServer, VaultConnection
-import logging
 
-logging.basicConfig(level=logging.INFO)
-
-def handle_message(conn_id: int, data: bytes, conn: VaultConnection):
-    """Echo back received messages"""
-    print(f"Received from {conn_id}: {data.decode()}")
+def handle_message(conn_id: int, data: bytes, conn: VaultConnection) -> None:
     conn.send(b"ECHO: " + data)
 
-# Create and start server
 server = VaultTCPServer(listen_ip="0.0.0.0", listen_port=5004)
 server.on_message = handle_message
-server.start()
+server.start()  # non-blocking, spawns its own threads
 
-print("Server running on port 5004...")
-# Keep server running
-try:
-    while True:
-        import time
-        time.sleep(1)
-except KeyboardInterrupt:
-    server.close()
+# ...
+server.close()
 ```
 
-### Client Example
+### Client
 
 ```python
 from vault_tcp import VaultTCPClient
 
-# Using context manager (recommended)
 with VaultTCPClient(server_ip="127.0.0.1", server_port=5004) as client:
     response = client.send_and_receive(b"Hello, Server!")
-    print(f"Server responded: {response.decode()}")
-
-# Manual connection management
-client = VaultTCPClient(server_ip="127.0.0.1", server_port=5004)
-client.connect()
-client.send(b"Hello")
-response = client.receive()
-client.close()
 ```
 
-## API Reference
+## How it works
 
-### VaultTCPServer
+- Messages are framed as a 4-byte big-endian length prefix followed by the
+  Noise ciphertext.
+- `VaultTCPServer` runs an accept loop and spawns one thread per connection.
+  Callbacks (`on_connect`, `on_message`, `on_disconnect`) run on that
+  connection's thread.
+- `VaultConnection.send()` is safe to call from multiple threads.
+  `VaultConnection.receive()` is not - use it from a single thread per
+  connection (which is how the server already uses it).
+- A connection that hits an encryption, decryption, or framing error closes
+  itself. The Noise cipher's nonce counter advances on every
+  encrypt/decrypt call, so a message that fails to fully send or a stream
+  read that fails mid-frame leaves the two sides out of sync; the
+  connection is not safe to reuse afterwards.
 
-Multi-client server with threaded connection handling.
+## Noise protocol / pattern selection
 
-#### Constructor
+Default: `Noise_NN_25519_AESGCM_SHA512` - X25519 key exchange, AES-GCM,
+SHA-512, and the **NN** pattern, meaning neither side authenticates the
+other. Anyone can complete a handshake with the server; only the transport
+is encrypted.
+
+For authentication, pass a different `proto_name` and static keys:
+
+```python
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+private_key = X25519PrivateKey.generate()
+private_bytes = private_key.private_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PrivateFormat.Raw,
+    encryption_algorithm=serialization.NoEncryption(),
+)
+
+server = VaultTCPServer(proto_name="Noise_XX_25519_AESGCM_SHA512")
+client = VaultTCPClient(
+    proto_name="Noise_XX_25519_AESGCM_SHA512",
+    static_key=private_bytes,
+)
+```
+
+Pattern letters (see the [Noise spec](http://www.noiseprotocol.org/noise.html#handshake-patterns)):
+
+| Pattern | Meaning |
+|---|---|
+| NN | No authentication (default) |
+| XX | Both sides authenticate, static keys exchanged during handshake |
+| NK | Client verifies a known server static key |
+| IK | Client sends its static key immediately, knows the server's in advance |
+
+## API
+
+### `VaultTCPServer`
 
 ```python
 VaultTCPServer(
@@ -98,47 +110,18 @@ VaultTCPServer(
     max_message_size: int = 64 * 1024,
     handshake_timeout: float = 10.0,
     message_timeout: float = 30.0,
-    idle_timeout: float = 300.0
+    idle_timeout: float = 300.0,  # 0 disables idle disconnection
 )
 ```
 
-**Parameters:**
-- `listen_ip`: IP address to bind to (default: "0.0.0.0")
-- `listen_port`: Port to listen on (default: 5004)
-- `proto_name`: Noise protocol name (default: "Noise_NN_25519_AESGCM_SHA512")
-- `max_message_size`: Maximum plaintext message size in bytes (default: 64KB)
-- `handshake_timeout`: Timeout for handshake operations in seconds (default: 10s)
-- `message_timeout`: Timeout for message operations in seconds (default: 30s)
-- `idle_timeout`: Timeout for idle connections in seconds, 0 to disable (default: 300s)
+- `start()` / `close()` - start/stop the accept loop and disconnect all clients
+- `send_to(conn_id, data)`, `broadcast(data)`
+- `get_connection_ids() -> list[int]`
+- `get_connection_stats(conn_id) -> dict`
+- callbacks: `on_connect(conn_id)`, `on_message(conn_id, data, conn)`,
+  `on_disconnect(conn_id)` - set before calling `start()`
 
-#### Methods
-
-- **`start()`**: Start the server (non-blocking)
-- **`send_to(conn_id: int, data: bytes)`**: Send data to specific connection
-- **`broadcast(data: bytes)`**: Send data to all connected clients
-- **`get_connection_ids() -> List[int]`**: Get list of active connection IDs
-- **`get_connection_stats(conn_id: int) -> dict`**: Get statistics for a connection
-- **`close()`**: Shutdown server gracefully
-
-#### Callbacks
-
-Set these before calling `start()`:
-
-```python
-server.on_message = lambda conn_id, data, conn: ...
-server.on_connect = lambda conn_id: ...
-server.on_disconnect = lambda conn_id: ...
-```
-
-- **`on_message(conn_id: int, data: bytes, conn: VaultConnection)`**: Called when message received
-- **`on_connect(conn_id: int)`**: Called when client connects
-- **`on_disconnect(conn_id: int)`**: Called when client disconnects
-
-### VaultTCPClient
-
-Client wrapper for connecting to VaultTCPServer.
-
-#### Constructor
+### `VaultTCPClient`
 
 ```python
 VaultTCPClient(
@@ -148,300 +131,91 @@ VaultTCPClient(
     max_message_size: int = 64 * 1024,
     handshake_timeout: float = 10.0,
     message_timeout: float = 30.0,
-    static_key: Optional[bytes] = None,
-    remote_static: Optional[bytes] = None
+    static_key: bytes | None = None,
+    remote_static: bytes | None = None,
 )
 ```
 
-#### Methods
+- `connect()` / `close()`, or use as a context manager (calls `connect()`
+  on enter)
+- `send(data)`, `receive() -> bytes`, `send_and_receive(data) -> bytes`
+- `get_stats() -> dict`
 
-- **`connect()`**: Connect to server and perform handshake
-- **`send(data: bytes)`**: Send data to server
-- **`receive() -> bytes`**: Receive data from server (blocking)
-- **`send_and_receive(data: bytes) -> bytes`**: Send and wait for response
-- **`get_stats() -> dict`**: Get connection statistics
-- **`close()`**: Close connection
+### `VaultConnection`
 
-#### Context Manager Support
+Wraps one handshaked socket. Used internally by both of the above;
+construct directly only if you need to manage the socket yourself.
 
-```python
-with VaultTCPClient(server_ip="127.0.0.1") as client:
-    response = client.send_and_receive(b"Hello")
-```
+- `do_handshake()`, `send(plaintext)`, `receive() -> bytes`, `close()`,
+  `get_stats() -> dict`
 
-### VaultConnection
-
-Low-level connection wrapper (typically not used directly).
-
-#### Methods
-
-- **`do_handshake()`**: Perform Noise protocol handshake
-- **`send(plaintext: bytes)`**: Encrypt and send message (thread-safe)
-- **`receive() -> bytes`**: Receive and decrypt message
-- **`get_stats() -> dict`**: Get connection statistics
-- **`close()`**: Close connection
-
-## Noise Protocol
-
-By default, uses **Noise_NN_25519_AESGCM_SHA512**:
-- **NN**: No static keys (anonymous)
-- **25519**: X25519 for key exchange
-- **AESGCM**: AES-GCM for encryption
-- **SHA512**: SHA-512 for hashing
-
-### Other Supported Patterns
-
-You can use different Noise patterns by changing `proto_name`:
+## Errors
 
 ```python
-# With static keys for authentication
-server = VaultTCPServer(proto_name="Noise_XX_25519_AESGCM_SHA512")
-
-# With pre-shared key
-server = VaultTCPServer(proto_name="Noise_NK_25519_AESGCM_SHA512")
-```
-
-Common patterns:
-- **NN**: Anonymous (no authentication)
-- **XX**: Mutual authentication with key exchange
-- **NK**: Server authentication
-- **IK**: Client knows server's static key
-
-See [Noise Protocol Patterns](http://www.noiseprotocol.org/noise.html#patterns) for details.
-
-## Advanced Usage
-
-### Custom Callbacks with State
-
-```python
-class ChatServer:
-    def __init__(self):
-        self.clients = {}
-        self.server = VaultTCPServer()
-        self.server.on_message = self.handle_message
-        self.server.on_connect = self.handle_connect
-        self.server.on_disconnect = self.handle_disconnect
-    
-    def handle_connect(self, conn_id: int):
-        self.clients[conn_id] = {"joined": time.time()}
-        print(f"Client {conn_id} joined")
-    
-    def handle_message(self, conn_id: int, data: bytes, conn: VaultConnection):
-        message = data.decode('utf-8')
-        print(f"[{conn_id}]: {message}")
-        
-        # Broadcast to all other clients
-        for cid in self.clients:
-            if cid != conn_id:
-                try:
-                    self.server.send_to(cid, f"[{conn_id}]: {message}".encode())
-                except Exception as e:
-                    print(f"Failed to send to {cid}: {e}")
-    
-    def handle_disconnect(self, conn_id: int):
-        if conn_id in self.clients:
-            del self.clients[conn_id]
-        print(f"Client {conn_id} left")
-    
-    def start(self):
-        self.server.start()
-
-# Usage
-chat = ChatServer()
-chat.start()
-```
-
-### Connection Statistics
-
-```python
-# Server-side
-stats = server.get_connection_stats(conn_id)
-print(f"Connection {conn_id}:")
-print(f"  Bytes sent: {stats['bytes_sent']}")
-print(f"  Bytes received: {stats['bytes_received']}")
-print(f"  Messages sent: {stats['messages_sent']}")
-print(f"  Messages received: {stats['messages_received']}")
-print(f"  Uptime: {stats['uptime_seconds']:.1f}s")
-
-# Client-side
-stats = client.get_stats()
-```
-
-### Using Static Keys for Authentication
-
-```python
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-
-# Generate static keypair
-private_key = X25519PrivateKey.generate()
-private_bytes = private_key.private_bytes(
-    encoding=serialization.Encoding.Raw,
-    format=serialization.PrivateFormat.Raw,
-    encryption_algorithm=serialization.NoEncryption()
-)
-
-# Server with static key
-server = VaultTCPServer(
-    proto_name="Noise_XX_25519_AESGCM_SHA512"
-)
-
-# Client with static key
-client = VaultTCPClient(
-    proto_name="Noise_XX_25519_AESGCM_SHA512",
-    static_key=private_bytes
-)
-```
-
-## Error Handling
-
-The library uses specific exception types:
-
-```python
-from vault_tcp import (
-    VaultProtocolError,      # Base protocol error
-    VaultHandshakeError,     # Handshake failed
-    VaultConnectionClosed    # Connection closed unexpectedly
-)
+from vault_tcp import VaultProtocolError, VaultHandshakeError, VaultConnectionClosed
 
 try:
     with VaultTCPClient() as client:
         client.send(b"data")
-except VaultHandshakeError as e:
-    print(f"Handshake failed: {e}")
-except VaultConnectionClosed as e:
-    print(f"Connection closed: {e}")
-except VaultProtocolError as e:
-    print(f"Protocol error: {e}")
-except TimeoutError as e:
-    print(f"Operation timed out: {e}")
+except VaultHandshakeError:
+    ...  # handshake didn't complete
+except VaultConnectionClosed:
+    ...  # peer closed the connection
+except VaultProtocolError:
+    ...  # encryption/decryption/framing failure; connection is closed
+except TimeoutError:
+    ...  # no data arrived in time; connection may still be usable
 ```
 
 ## Logging
 
-The library uses Python's standard `logging` module:
+Uses the standard `logging` module under the `vault_tcp` logger name.
 
 ```python
 import logging
-
-# Configure logging level
 logging.getLogger("vault_tcp").setLevel(logging.DEBUG)
-
-# Or configure all logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
 ```
 
-## Security Considerations
+## Limitations / things to know before using this for anything real
 
-1. **Noise Protocol**: Provides forward secrecy and strong encryption
-2. **Message Size Limits**: Default 64KB prevents memory exhaustion attacks
-3. **Timeouts**: Prevent resource exhaustion from slow/stalled connections
-4. **Idle Detection**: Automatically closes inactive connections
-5. **No Authentication**: Default NN pattern is anonymous - use XX/IK patterns for authentication
-
-### Production Recommendations
-
-- Use authenticated patterns (XX, IK) instead of anonymous (NN)
-- Implement rate limiting for your use case
-- Monitor connection statistics for anomalies
-- Use TLS for additional transport security if needed
-- Validate message contents after decryption
-- Run behind a firewall or reverse proxy
+- Default pattern (NN) is unauthenticated - use XX/NK/IK if you need to
+  verify who you're talking to.
+- No built-in rate limiting or connection limits.
+- One thread per connection; not tested at high connection counts.
+- `max_message_size` bounds a single message but there's no application-level
+  flow control beyond TCP's own backpressure.
+- Not independently security-audited.
 
 ## Development
 
 ```bash
 pip install -e ".[dev]"
 
-ruff check .          # lint
-ruff format .         # format
-mypy vault_tcp.py     # type-check
-pytest                # run the test suite
+ruff check .        # lint
+ruff format .       # format
+mypy vault_tcp.py   # type-check
+pytest              # tests
 ```
-
-To run these automatically before each commit:
 
 ```bash
-pre-commit install
+pre-commit install  # run the above automatically before each commit
 ```
 
-## Testing
-
-Run the included example:
-
-```bash
-python vault_tcp.py
-```
-
-This starts an echo server and tests it with a client.
-
-## Performance
-
-Typical performance on modern hardware:
-- **Throughput**: ~100-200 MB/s per connection
-- **Latency**: <1ms for small messages on localhost
-- **Concurrent Connections**: Hundreds to thousands (OS dependent)
-
-The server uses one thread per connection, suitable for moderate connection counts. For very high connection counts, consider implementing an async version.
+CI (`.github/workflows/ci.yml`) runs the same checks on Python 3.10-3.13.
 
 ## Troubleshooting
 
-### "Handshake failed" errors
-
-- Check that both sides use the same `proto_name`
-- Verify network connectivity
-- Check firewall rules
-- Ensure sufficient timeout values
-
-### "Connection closed" errors
-
-- Check idle timeout settings
-- Verify both sides are properly closing connections
-- Check network stability
-
-### High CPU usage
-
-- Reduce number of concurrent connections
-- Increase message batching
-- Check for busy-wait loops in callbacks
-
-### Memory issues
-
-- Reduce `max_message_size` if messages are large
-- Implement connection limits
-- Monitor for connection leaks (forgotten `close()`)
+- **Handshake fails**: both sides must use the same `proto_name`.
+- **Connection closes unexpectedly**: check `idle_timeout`/`message_timeout`
+  values, and whether the peer is closing its side.
+- **`VaultProtocolError` after previously working fine**: the connection
+  hit an error and closed itself (see "How it works" above) - open a new one.
 
 ## License
 
-- Copyright [2025] [ecki]
-- SPDX-License-Identifier: Apache-2.0
-
-
-## Contributing
-
-[Add contributing guidelines here]
+Apache-2.0, Copyright 2025 ecki. See [LICENSE](LICENSE).
 
 ## Credits
 
-Built with:
-- [noiseprotocol](https://github.com/plizonczyk/noiseprotocol) - Python implementation of Noise Protocol
-- [Noise Protocol Framework](http://www.noiseprotocol.org/) - By Trevor Perrin
-
-## Changelog
-
-### Version 2.0 (Current)
-- Complete rewrite with robust error handling
-- Added context manager support
-- Improved handshake logic
-- Added connection statistics
-- Added idle timeout detection
-- Improved logging and type hints
-- Better thread safety
-- Graceful shutdown
-
-### Version 1.0 (Original)
-- Initial implementation
-- Basic Noise protocol support
-- Multi-threaded server
+Built on [noiseprotocol](https://github.com/plizonczyk/noiseprotocol),
+an implementation of the [Noise Protocol Framework](http://www.noiseprotocol.org/).
